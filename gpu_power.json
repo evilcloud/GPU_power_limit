@@ -1,0 +1,36 @@
+{
+    "power_limits": [
+        {
+            "model": "NVIDIA GeForce GTX 1080 Ti",
+            "limit": 130
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3060",
+            "limit": 120
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3060 Ti",
+            "limit": 140
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3070",
+            "limit": 130
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3070 Ti",
+            "limit": 125
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3080",
+            "limit": 220
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3080 Ti",
+            "limit": 300
+        },
+        {
+            "model": "NVIDIA GeForce RTX 3090",
+            "limit": 330
+        }
+    ]
+}
