@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 const (
 	githubURL = "https://raw.githubusercontent.com/evilcloud/GPU_power_limit/main/gpu_power.json"
 	errorFile = "errors.log"
+	logFile   = "log.log"
 )
 
 type PowerLimit struct {
@@ -35,14 +35,32 @@ type GPU struct {
 	UUID   string
 }
 
+type PowerLimitData struct {
+	GPU      GPU
+	OldLimit int
+	NewLimit int
+}
+
 func executeCommand(command string) (string, error) {
 	cmd := exec.Command("bash", "-c", command)
+	// cmd := exec.Command("/bin/sh", "-c", command)
 	output, err := cmd.Output()
 	if err != nil {
-		logError(err)
+		if _, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("command not found")
+		}
 		return "", err
 	}
 	return string(output), nil
+}
+
+func saveToFile(fileName string, data []byte) error {
+	err := ioutil.WriteFile(fileName, data, 0644)
+	if err != nil {
+		logError(err)
+		return err
+	}
+	return nil
 }
 
 func getGithubData() (*PowerLimits, error) {
@@ -65,61 +83,114 @@ func getGithubData() (*PowerLimits, error) {
 		logError(err)
 		return nil, err
 	}
-
 	return &powerLimits, nil
 }
 
-func getNvidiaSMI() ([]GPU, error) {
-	cmd := exec.Command("bash", "-c", "nvidia-smi -L")
-	out, err := cmd.Output()
-	if err != nil {
+func parseNvidiaSMI(line string) (*GPU, error) {
+	if !strings.Contains(line, ":") {
+		err := fmt.Errorf("the line is not valid: %s", line)
 		logError(err)
-		if _, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("nvidia-smi not found, please check if it is installed on your system")
-		}
 		return nil, err
 	}
+	headtail := strings.SplitN(line, ":", 2)
+	if len(headtail) != 2 {
+		err := fmt.Errorf("can not parse line: %s", line)
+		logError(err)
+		return nil, err
+	}
+	head := headtail[0]
+	tail := headtail[1]
 
-	// Parse the output of "nvidia-smi -L" to isolate the GPU number, model and UUID
-	re := regexp.MustCompile(`GPU (\d+): ([\w ]+) \(UUID: GPU-[\w-]+\)`)
-	matches := re.FindAllStringSubmatch(string(out), -1)
+	num := strings.Fields(head)[1]
+	model := strings.TrimSpace(strings.Split(tail, "(UUID:")[0])
+	uuid := strings.TrimRight(strings.Split(tail, "(UUID:")[1], ")")
 
-	var gpus []GPU
-	for _, match := range matches {
-		fmt.Println(match)
-		return nil, nil
-		number, err := strconv.Atoi(strings.TrimSpace(match[1]))
+	number, err := strconv.Atoi(strings.TrimSpace(num))
+	if err != nil {
+		number = 999
+	}
+
+	return &GPU{
+		Number: number,
+		Model:  model,
+		UUID:   uuid,
+	}, nil
+}
+
+func getNvidiaSMI() ([]GPU, error) {
+	output, err := executeCommand("nvidia-smi -L")
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(output), "\n")
+
+	gpus := make([]GPU, 0)
+	for _, line := range lines {
+		if !strings.Contains(line, "GPU") {
+			continue
+		}
+		gpu, err := parseNvidiaSMI(line)
+
 		if err != nil {
-			logError(err)
-			return nil, err
+			logError(fmt.Errorf("failed to parse line: %s", line))
+			continue
 		}
-		gpu := GPU{
-			Number: number,
-			Model:  strings.TrimSpace(match[2]),
-			UUID:   strings.TrimSpace(match[3]),
-		}
-
-		gpus = append(gpus, gpu)
+		gpus = append(gpus, *gpu)
 	}
 	return gpus, nil
 }
 
-// set the power limit for each GPU as per prived power limits data
-func setPowerLimits(powerLimits *PowerLimits, gpus []GPU) error {
-	for _, gpu := range gpus {
-		for _, powerLimit := range powerLimits.PowerLimits {
-			if gpu.Model == powerLimit.Model {
-				// set the power limit for the GPU
-				command := fmt.Sprintf("nvidia-smi -i %d -pl %d", gpu.Number, powerLimit.Limit)
-				_, err := executeCommand(command)
-				if err != nil {
-					logError(err)
-					return err
-				}
-			}
+func setGPUPowerLimit(gpu GPU, limit int) error {
+	command := fmt.Sprintf("nvidia-smi -i %d -pl %d", gpu.Number, limit)
+	output, err := executeCommand(command)
+	if err != nil {
+		logError(err)
+		return err
+	}
+	gpuNumber, oldLimit, newLimit, err := parseGPUPowerLimitOutput(output)
+	if err != nil {
+		logError(err)
+		return err
+	}
+	fmt.Printf(" %d %s: %d -> %d\n", gpuNumber, gpu.Model, oldLimit, newLimit)
+	// string with current date and time, gpu number, gpu model, old limit, new limit
+	writeToFile(fmt.Sprintf(" %d %s: %d -> %d\n", gpuNumber, gpu.Model, oldLimit, newLimit))
+	return nil
+}
+
+func strToInt(s string) int {
+	if strings.Contains(s, ".") {
+		s = strings.Split(s, ".")[0]
+	}
+	if strings.Contains(s, ":") {
+		s = strings.Split(s, ":")[1]
+		s, err := strconv.ParseInt(s, 16, 32)
+		if err == nil {
+			return int(s)
 		}
 	}
-	return nil
+	i, err := strconv.Atoi(s)
+	if err == nil {
+		return i
+	}
+	return 999
+}
+
+func parseGPUPowerLimitOutput(output string) (int, int, int, error) {
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if !strings.Contains(line, "Power limit for GPU") {
+			continue
+		}
+		fields := strings.Fields(line)
+
+		gpuNumber := strToInt(fields[4])
+		oldLimit := strToInt(fields[11])
+		newLimit := strToInt(fields[8])
+
+		return gpuNumber, oldLimit, newLimit, nil
+	}
+	return 0, 0, 0, fmt.Errorf("can not parse line: %s", output)
 }
 
 func logError(err error) {
@@ -144,21 +215,50 @@ func logError(err error) {
 	}
 }
 
-func main() {
-	powerLimits, err := getGithubData()
+// function that writes into a file provided string by the user
+// file name log.txt
+func writeToFile(s string) {
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		logError(err)
-		log.Fatal(err)
+		return
 	}
+	defer f.Close()
+
+	if _, err := f.WriteString(s); err != nil {
+		logError(err)
+		return
+	}
+}
+
+func main() {
+	start := time.Now()
+	powerLimits, err := getGithubData() // get the data from github
+	if err != nil {
+		logError(err) // log the error
+		return
+	}
+
+	fmt.Printf("%d power limit settings found\n", len(powerLimits.PowerLimits)) // print the number of power limits found
+
 	gpus, err := getNvidiaSMI()
 	if err != nil {
 		logError(err)
-		log.Fatal(err)
 	}
-	err = setPowerLimits(powerLimits, gpus)
-	if err != nil {
-		logError(err)
-		log.Fatal(err)
+
+	writeToFile(fmt.Sprintf("%s %d power limit settings found\n", time.Now().Format(time.RFC3339), len(powerLimits.PowerLimits)))
+	for _, gpu := range gpus {
+		for _, powerLimit := range powerLimits.PowerLimits {
+			if strings.Contains(gpu.Model, powerLimit.Model) {
+				err := setGPUPowerLimit(gpu, powerLimit.Limit)
+				if err != nil {
+					logError(err)
+				}
+			}
+		}
 	}
-	fmt.Println("Successfully set the power limits")
+	elapsed := time.Since(start)
+	fmt.Printf("Execution time: %s\n", (elapsed.Round(time.Millisecond)))
+	writeToFile(fmt.Sprintf("Execution time: %s\n", (time.Since(start).Round(time.Millisecond))))
+
 }
